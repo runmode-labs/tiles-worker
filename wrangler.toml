@@ -1,0 +1,11 @@
+name = "tiles-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "runmodelabs-tiles"
+
+[vars]
+ALLOWED_ORIGINS = "https://analyzemy.run,https://app.analyzemy.run,http://localhost:5173"
+CACHE_CONTROL = "public, max-age=86400"
