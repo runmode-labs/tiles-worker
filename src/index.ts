@@ -46,12 +46,25 @@ function pmtilesPath(name: string, setting?: string): string {
   return `${name}.pmtiles`;
 }
 
+interface TileParsed {
+  ok: boolean;
+  name: string;
+  tile?: [number, number, number];
+  ext: string;
+  rangeRequest?: boolean;
+}
+
 function tilePath(
   path: string,
-): { ok: boolean; name: string; tile?: [number, number, number]; ext: string } {
+  hasRangeHeader: boolean,
+): TileParsed {
   const parts = path.split("/").filter(Boolean);
   if (parts.length === 1 && parts[0]!.endsWith(".json")) {
     return { ok: true, name: parts[0]!.replace(".json", ""), ext: "json" };
+  }
+  // Bare path like /basemap with Range header = PMTiles range request pass-through
+  if (parts.length === 1 && !parts[0]!.includes(".") && hasRangeHeader) {
+    return { ok: true, name: parts[0]!, ext: "", rangeRequest: true };
   }
   if (parts.length === 4) {
     const name = parts[0]!;
@@ -126,7 +139,8 @@ export default {
     }
 
     const url = new URL(request.url);
-    const { ok, name, tile, ext } = tilePath(url.pathname);
+    const hasRange = request.headers.has("Range");
+    const { ok, name, tile, ext, rangeRequest } = tilePath(url.pathname, hasRange);
     const cache = caches.default;
 
     if (!ok) {
@@ -142,13 +156,68 @@ export default {
       }
     }
 
+    const corsHeaders = (headers: Headers): Headers => {
+      if (allowedOrigin) {
+        headers.set("Access-Control-Allow-Origin", allowedOrigin);
+      }
+      headers.set("Vary", "Origin");
+      return headers;
+    };
+
+    // Handle CORS preflight
+    if (request.method.toUpperCase() === "OPTIONS") {
+      const headers = new Headers();
+      corsHeaders(headers);
+      headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+      headers.set("Access-Control-Allow-Headers", "Range");
+      headers.set("Access-Control-Max-Age", "86400");
+      return new Response(undefined, { status: 204, headers });
+    }
+
+    // PMTiles range request pass-through: browser pmtiles library sends
+    // Range requests to /basemap which we proxy to the .pmtiles file in R2.
+    if (rangeRequest) {
+      const key = pmtilesPath(name, env.PMTILES_PATH);
+      const rangeHeader = request.headers.get("Range");
+
+      const obj = rangeHeader
+        ? await env.BUCKET.get(key, { range: request.headers })
+        : await env.BUCKET.get(key);
+
+      if (!obj) {
+        const headers = corsHeaders(new Headers());
+        return new Response("Archive not found", { status: 404, headers });
+      }
+
+      const respHeaders = corsHeaders(new Headers());
+      respHeaders.set("Content-Type", "application/octet-stream");
+      respHeaders.set("Cache-Control", env.CACHE_CONTROL || "public, max-age=86400");
+      respHeaders.set("Accept-Ranges", "bytes");
+
+      if (obj.range) {
+        const r = obj.range as { offset: number; length: number };
+        respHeaders.set(
+          "Content-Range",
+          `bytes ${r.offset}-${r.offset + r.length - 1}/${obj.size}`,
+        );
+        respHeaders.set("Content-Length", String(r.length));
+        return new Response((obj as R2ObjectBody).body, {
+          status: 206,
+          headers: respHeaders,
+        });
+      }
+
+      respHeaders.set("Content-Length", String(obj.size));
+      return new Response((obj as R2ObjectBody).body, {
+        status: 200,
+        headers: respHeaders,
+      });
+    }
+
+    // Standard tile/TileJSON serving with CF Cache API
     const cached = await cache.match(request.url);
     if (cached) {
-      const respHeaders = new Headers(cached.headers);
-      if (allowedOrigin) {
-        respHeaders.set("Access-Control-Allow-Origin", allowedOrigin);
-      }
-      respHeaders.set("Vary", "Origin");
+      const respHeaders = corsHeaders(new Headers(cached.headers));
       return new Response(cached.body, {
         headers: respHeaders,
         status: cached.status,
@@ -170,11 +239,7 @@ export default {
       });
       ctx.waitUntil(cache.put(request.url, cacheable));
 
-      const respHeaders = new Headers(cacheableHeaders);
-      if (allowedOrigin) {
-        respHeaders.set("Access-Control-Allow-Origin", allowedOrigin);
-      }
-      respHeaders.set("Vary", "Origin");
+      const respHeaders = corsHeaders(new Headers(cacheableHeaders));
       return new Response(body, { headers: respHeaders, status });
     };
 
